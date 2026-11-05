@@ -34,6 +34,10 @@ typedef struct OSAL_PACKED
 } ec_SoEt;
 OSAL_PACKED_END
 
+/* Validate SoE structure meets protocol minimum */
+EC_STATIC_ASSERT(sizeof(ec_SoEt) == (sizeof(ec_mbxheadert) + EC_MBX_MIN_SOE),
+                 "ec_SoEt incorrect size");
+
 /** Report SoE error.
  *
  * @param[in]  context    context struct
@@ -89,6 +93,11 @@ int ecx_SoEread(ecx_contextt *context, uint16 slave, uint8 driveNo, uint8 elemen
    /* Empty slave out mailbox if something is in. Timeout set to 0 */
    wkc = ecx_mbxreceive(context, slave, &MbxIn, 0);
    MbxOut = ecx_getmbx(context);
+   if (!MbxOut)
+   {
+      if (MbxIn) ecx_dropmbx(context, MbxIn);
+      return 0;
+   }
    ec_clearmbx(MbxOut);
    SoEp = (ec_SoEt *)MbxOut;
    SoEp->MbxHeader.length = htoes(sizeof(ec_SoEt) - sizeof(ec_mbxheadert));
@@ -106,7 +115,6 @@ int ecx_SoEread(ecx_contextt *context, uint16 slave, uint8 driveNo, uint8 elemen
    SoEp->idn = htoes(idn);
    totalsize = 0;
    bp = p;
-   mp = (uint8 *)MbxIn + sizeof(ec_SoEt);
    NotLast = TRUE;
    /* send SoE request to slave */
    wkc = ecx_mbxsend(context, slave, MbxOut, EC_TIMEOUTTXM);
@@ -129,7 +137,8 @@ int ecx_SoEread(ecx_contextt *context, uint16 slave, uint8 driveNo, uint8 elemen
                 (aSoEp->driveNo == driveNo) &&
                 (aSoEp->elementflags == elementflags))
             {
-               framedatasize = etohs(aSoEp->MbxHeader.length) - sizeof(ec_SoEt) + sizeof(ec_mbxheadert);
+               mp = (uint8 *)MbxIn + sizeof(ec_SoEt);
+               framedatasize = etohs(aSoEp->MbxHeader.length) - EC_MBX_MIN_SOE;
                totalsize += framedatasize;
                /* Does parameter fit in parameter buffer ? */
                if (totalsize <= *psize)
@@ -211,6 +220,12 @@ int ecx_SoEwrite(ecx_contextt *context, uint16 slave, uint8 driveNo, uint8 eleme
    uint8 cnt;
    boolean NotLast;
 
+   /* slave must have a usable mailbox */
+   if ((context->slavelist[slave].mbx_l < EC_MBX_MINSIZE) ||
+       (context->slavelist[slave].mbx_l > EC_MAXMBX))
+   {
+      return 0;
+   }
    MbxIn = NULL;
    MbxOut = NULL;
    /* Empty slave out mailbox if something is in. Timeout set to 0 */
@@ -221,6 +236,11 @@ int ecx_SoEwrite(ecx_contextt *context, uint16 slave, uint8 driveNo, uint8 eleme
    while (NotLast)
    {
       MbxOut = ecx_getmbx(context);
+      if (!MbxOut)
+      {
+         wkc = 0;
+         break;
+      }
       ec_clearmbx(MbxOut);
       SoEp = (ec_SoEt *)MbxOut;
       SoEp->MbxHeader.address = htoes(0x0000);
@@ -333,7 +353,8 @@ int ecx_readIDNmap(ecx_contextt *context, uint16 slave, uint32 *Osize, uint32 *I
       psize = sizeof(SoEmapping);
       /* read output mapping via SoE */
       wkc = ecx_SoEread(context, slave, driveNr, EC_SOE_VALUE_B, EC_IDN_MDTCONFIG, &psize, &SoEmapping, EC_TIMEOUTRXM);
-      if ((wkc > 0) && (psize >= 4) && ((entries = etohs(SoEmapping.currentlength) / 2) > 0) && (entries <= EC_SOE_MAXMAPPING))
+      if ((wkc > 0) && (psize >= 4) && ((entries = etohs(SoEmapping.currentlength) / 2) > 0) &&
+          (entries <= ((psize - 4) / 2)))
       {
          /* command word (uint16) is always mapped but not in list */
          *Osize += 16;
@@ -342,7 +363,7 @@ int ecx_readIDNmap(ecx_contextt *context, uint16 slave, uint32 *Osize, uint32 *I
             psize = sizeof(SoEattribute);
             /* read attribute of each IDN in mapping list */
             wkc = ecx_SoEread(context, slave, driveNr, EC_SOE_ATTRIBUTE_B, SoEmapping.idn[itemcount], &psize, &SoEattribute, EC_TIMEOUTRXM);
-            if ((wkc > 0) && (!SoEattribute.list))
+            if ((wkc > 0) && (psize >= (int)sizeof(SoEattribute)) && (!SoEattribute.list))
             {
                /* length : 0 = 8bit, 1 = 16bit .... */
                *Osize += (int)8 << SoEattribute.length;
@@ -352,7 +373,8 @@ int ecx_readIDNmap(ecx_contextt *context, uint16 slave, uint32 *Osize, uint32 *I
       psize = sizeof(SoEmapping);
       /* read input mapping via SoE */
       wkc = ecx_SoEread(context, slave, driveNr, EC_SOE_VALUE_B, EC_IDN_ATCONFIG, &psize, &SoEmapping, EC_TIMEOUTRXM);
-      if ((wkc > 0) && (psize >= 4) && ((entries = etohs(SoEmapping.currentlength) / 2) > 0) && (entries <= EC_SOE_MAXMAPPING))
+      if ((wkc > 0) && (psize >= 4) && ((entries = etohs(SoEmapping.currentlength) / 2) > 0) &&
+          (entries <= ((psize - 4) / 2)))
       {
          /* status word (uint16) is always mapped but not in list */
          *Isize += 16;
@@ -361,7 +383,7 @@ int ecx_readIDNmap(ecx_contextt *context, uint16 slave, uint32 *Osize, uint32 *I
             psize = sizeof(SoEattribute);
             /* read attribute of each IDN in mapping list */
             wkc = ecx_SoEread(context, slave, driveNr, EC_SOE_ATTRIBUTE_B, SoEmapping.idn[itemcount], &psize, &SoEattribute, EC_TIMEOUTRXM);
-            if ((wkc > 0) && (!SoEattribute.list))
+            if ((wkc > 0) && (psize >= (int)sizeof(SoEattribute)) && (!SoEattribute.list))
             {
                /* length : 0 = 8bit, 1 = 16bit .... */
                *Isize += (int)8 << SoEattribute.length;

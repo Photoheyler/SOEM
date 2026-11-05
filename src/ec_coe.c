@@ -34,6 +34,10 @@ typedef struct OSAL_PACKED
 } ec_SDOt;
 OSAL_PACKED_END
 
+/* Validate CoE structure meets protocol minimum */
+EC_STATIC_ASSERT(sizeof(ec_SDOt) >= (sizeof(ec_mbxheadert) + EC_MBX_MIN_COE),
+                 "ec_SDOt incorrect size");
+
 /** SDO service structure */
 OSAL_PACKED_BEGIN
 typedef struct OSAL_PACKED
@@ -120,7 +124,7 @@ int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subinde
    ec_SDOt *SDOp, *aSDOp;
    uint16 bytesize, Framedatasize;
    int wkc = 0;
-   int32 SDOlen;
+   uint32 SDOlen;
    uint8 *bp;
    uint8 *hp;
    ec_mbxbuft *MbxIn, *MbxOut;
@@ -197,20 +201,21 @@ int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subinde
             else
             { /* normal frame response */
                SDOlen = etohl(aSDOp->ldata[0]);
-               /* Does parameter fit in parameter buffer ? */
-               if (SDOlen <= *psize)
+               /* Validate SDOlen is reasonable and fits in parameter buffer */
+               if ((SDOlen != 0) && (SDOlen <= (uint32)*psize))
                {
+                  uint32 total = 0;
                   bp = p;
                   hp = p;
                   /* calculate mailbox transfer size */
-                  Framedatasize = (etohs(aSDOp->MbxHeader.length) - 10);
+                  Framedatasize = (etohs(aSDOp->MbxHeader.length) - EC_MBX_MIN_COE);
                   if (Framedatasize < SDOlen) /* transfer in segments? */
                   {
                      /* copy parameter data in parameter buffer */
                      memcpy(hp, &aSDOp->ldata[1], Framedatasize);
                      /* increment buffer pointer */
                      hp += Framedatasize;
-                     *psize = Framedatasize;
+                     total = Framedatasize;
                      NotLast = TRUE;
                      toggle = 0x00;
                      while (NotLast) /* segmented transfer */
@@ -252,13 +257,22 @@ int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subinde
                                    ((aSDOp->Command & 0xe0) == 0x00)))
                               {
                                  /* calculate mailbox transfer size */
+                                 /* Segment overhead: 2 bytes CoE header + 1 byte command = 3 */
                                  Framedatasize = etohs(aSDOp->MbxHeader.length) - 3;
-                                 if ((aSDOp->Command & 0x01) > 0)
+                                 if (((aSDOp->Command & 0x01) > 0) && (Framedatasize == 7))
+                                    /* last segment, subtract unused bytes from frame */
+                                    Framedatasize = Framedatasize - ((aSDOp->Command & 0x0e) >> 1);
+
+                                 /* Validate slave does not send more data than requested */
+                                 if ((uint32)total + (uint32)Framedatasize > SDOlen)
+                                 {
+                                    NotLast = FALSE;
+                                    ecx_packeterror(context, slave, index, subindex, 3);
+                                    wkc = 0;
+                                 }
+                                 else if ((aSDOp->Command & 0x01) > 0)
                                  { /* last segment */
                                     NotLast = FALSE;
-                                    if (Framedatasize == 7)
-                                       /* subtract unused bytes from frame */
-                                       Framedatasize = Framedatasize - ((aSDOp->Command & 0x0e) >> 1);
                                     /* copy to parameter buffer */
                                     memcpy(hp, &(aSDOp->Index), Framedatasize);
                                  }
@@ -269,8 +283,8 @@ int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subinde
                                     /* increment buffer pointer */
                                     hp += Framedatasize;
                                  }
-                                 /* update parameter size */
-                                 *psize += Framedatasize;
+                                 /* update total */
+                                 total += (uint32)Framedatasize;
                               }
                               /* unexpected frame returned from slave */
                               else
@@ -284,7 +298,17 @@ int ecx_SDOread(ecx_contextt *context, uint16 slave, uint16 index, uint8 subinde
                               }
                            }
                         }
+                        /* stop if request failed or slave did not respond */
+                        if (wkc <= 0)
+                        {
+                           NotLast = FALSE;
+                        }
                         toggle = toggle ^ 0x10; /* toggle bit for segment request */
+                     }
+                     /* Only update *psize on successful completion */
+                     if (wkc > 0)
+                     {
+                        *psize = total;
                      }
                   }
                   /* non segmented transfer */
@@ -351,6 +375,12 @@ int ecx_SDOwrite(ecx_contextt *context, uint16 Slave, uint16 Index, uint8 SubInd
    boolean NotLast;
    const uint8 *hp;
 
+   /* slave must have a usable mailbox */
+   if ((context->slavelist[Slave].mbx_l < EC_MBX_MINSIZE) ||
+       (context->slavelist[Slave].mbx_l > EC_MAXMBX))
+   {
+      return 0;
+   }
    MbxIn = NULL;
    MbxOut = NULL;
    wkc = ecx_mbxreceive(context, Slave, &MbxIn, 0);
@@ -545,6 +575,11 @@ int ecx_SDOwrite(ecx_contextt *context, uint16 Slave, uint16 Index, uint8 SubInd
                         }
                      }
                   }
+                  /* stop if request failed or slave did not respond */
+                  if (wkc <= 0)
+                  {
+                     NotLast = FALSE;
+                  }
                   toggle = toggle ^ 0x10; /* toggle bit for segment request */
                }
             }
@@ -587,6 +622,12 @@ int ecx_RxPDO(ecx_contextt *context, uint16 Slave, uint16 RxPDOnumber, int psize
    ec_mbxbuft *MbxIn, *MbxOut;
    uint8 cnt;
 
+   /* slave must have a usable mailbox */
+   if ((context->slavelist[Slave].mbx_l < EC_MBX_MINSIZE) ||
+       (context->slavelist[Slave].mbx_l > EC_MAXMBX))
+   {
+      return 0;
+   }
    MbxIn = NULL;
    MbxOut = NULL;
    wkc = ecx_mbxreceive(context, Slave, &MbxIn, 0);
@@ -726,8 +767,12 @@ uint32 ecx_readPDOassign(ecx_contextt *context, uint16 Slave, uint16 PDOassign)
    /* positive result from slave ? */
    if ((wkc > 0) && (rdat > 0))
    {
-      /* number of available sub indexes */
+      /* number of available sub indexes, subindex 0 is UINT8 (max 254) */
       nidx = rdat;
+      if (nidx > 254)
+      {
+         nidx = 254;
+      }
       bsize = 0;
       /* read all PDO's */
       for (idxloop = 1; idxloop <= nidx; idxloop++)
@@ -745,6 +790,10 @@ uint32 ecx_readPDOassign(ecx_contextt *context, uint16 Slave, uint16 PDOassign)
             /* read number of subindexes of PDO */
             wkc = ecx_SDOread(context, Slave, idx, 0x00, FALSE, &rdl, &subcnt, EC_TIMEOUTRXM);
             subidx = subcnt;
+            if (subidx > 254)
+            {
+               subidx = 254;
+            }
             /* for each subindex */
             for (subidxloop = 1; subidxloop <= subidx; subidxloop++)
             {
@@ -798,6 +847,10 @@ uint32 ecx_readPDOassignCA(ecx_contextt *context, uint16 Slave, int Thread_n,
    if ((wkc > 0) && (context->PDOassign[Thread_n].n > 0))
    {
       nidx = context->PDOassign[Thread_n].n;
+      if (nidx > 254)
+      {
+         nidx = 254;
+      }
       bsize = 0;
       /* for each PDO do */
       for (idxloop = 1; idxloop <= nidx; idxloop++)
@@ -812,6 +865,10 @@ uint32 ecx_readPDOassignCA(ecx_contextt *context, uint16 Slave, int Thread_n,
             wkc = ecx_SDOread(context, Slave, idx, 0x00, TRUE, &rdl,
                               &(context->PDOdesc[Thread_n]), EC_TIMEOUTRXM);
             subidx = context->PDOdesc[Thread_n].n;
+            if (subidx > 254)
+            {
+               subidx = 254;
+            }
             /* extract all bitlengths of SDO's */
             for (subidxloop = 1; subidxloop <= subidx; subidxloop++)
             {

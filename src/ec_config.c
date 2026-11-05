@@ -103,9 +103,12 @@ static void ecx_set_slaves_to_default(ecx_contextt *context)
    b = 0x00;
    ecx_BWR(&context->port, 0x0000, ECT_REG_DCSYNCACT, sizeof(b), &b, EC_TIMEOUTRET3); /* reset activation register */
    ecx_BWR(&context->port, 0x0000, ECT_REG_DCSYSTIME, 4, &zbuf, EC_TIMEOUTRET3);      /* reset system time+ofs */
+   /* system time offset (0x0920, 8 bytes) and propagation delay (0x0928, 4 bytes) */
+   ecx_BWR(&context->port, 0x0000, ECT_REG_DCSYSOFFSET, 12, &zbuf, EC_TIMEOUTRET3);
    w = htoes(0x1000);
    ecx_BWR(&context->port, 0x0000, ECT_REG_DCSPEEDCNT, sizeof(w), &w, EC_TIMEOUTRET3); /* DC speedstart */
-   w = htoes(0x0c00);
+   /* 0x0934 system time difference filter depth = 4, 0x0935 speed counter filter depth = 12 */
+   w = htoes(0x0c04);
    ecx_BWR(&context->port, 0x0000, ECT_REG_DCTIMEFILT, sizeof(w), &w, EC_TIMEOUTRET3); /* DC filt expr */
    b = 0x00;
    ecx_BWR(&context->port, 0x0000, ECT_REG_DLALIAS, sizeof(b), &b, EC_TIMEOUTRET3); /* Ignore Alias register */
@@ -339,6 +342,22 @@ int ecx_config_init(ecx_contextt *context)
          }
          (void)ecx_statecheck(context, slave, EC_STATE_INIT, EC_TIMEOUTSTATE); //* check state change Init */
 
+         if (context->slavelist[slave].mbx_l > 0)
+         {
+            eedat = ecx_readeeprom2(context, slave, EC_TIMEOUTEEP);
+            context->slavelist[slave].mbx_proto = (uint16)etohl(eedat);
+            /* disable mailbox if SII mailbox sizes are unusable */
+            if ((context->slavelist[slave].mbx_l < EC_MBX_MINSIZE) ||
+                (context->slavelist[slave].mbx_l > EC_MAXMBX) ||
+                (context->slavelist[slave].mbx_rl < EC_MBX_MINSIZE) ||
+                (context->slavelist[slave].mbx_rl > EC_MAXMBX))
+            {
+               EC_PRINT("Slave %d: invalid mailbox size, mailbox disabled\n", slave);
+               context->slavelist[slave].mbx_l = 0;
+               context->slavelist[slave].mbx_rl = 0;
+               context->slavelist[slave].mbx_proto = 0;
+            }
+         }
          /* set default mailbox configuration if slave has mailbox */
          if (context->slavelist[slave].mbx_l > 0)
          {
@@ -352,8 +371,6 @@ int ecx_config_init(ecx_contextt *context)
             context->slavelist[slave].SM[1].StartAddr = htoes(context->slavelist[slave].mbx_ro);
             context->slavelist[slave].SM[1].SMlength = htoes(context->slavelist[slave].mbx_rl);
             context->slavelist[slave].SM[1].SMflags = htoel(EC_DEFAULTMBXSM1);
-            eedat = ecx_readeeprom2(context, slave, EC_TIMEOUTEEP);
-            context->slavelist[slave].mbx_proto = (uint16)etohl(eedat);
          }
          /* find configuration via SII */
          if (!ecx_lookup_prev_sii(context, slave))
@@ -778,7 +795,7 @@ static void ecx_config_create_input_mappings(ecx_contextt *context, void *pIOmap
 
    configadr = context->slavelist[slave].configadr;
    FMMUc = context->slavelist[slave].FMMUunused;
-   if (context->slavelist[slave].Obits) /* find free FMMU */
+   if (context->slavelist[slave].Obits && (FMMUc < EC_MAXFMMU)) /* find free FMMU */
    {
       while (context->slavelist[slave].FMMU[FMMUc].LogStart)
       {
@@ -786,7 +803,7 @@ static void ecx_config_create_input_mappings(ecx_contextt *context, void *pIOmap
       }
    }
    /* search for SM that contribute to the input mapping */
-   while ((SMc < EC_MAXSM) && (FMMUdone < ((context->slavelist[slave].Ibits + 7) / 8)))
+   while ((SMc < EC_MAXSM) && (FMMUdone < ((context->slavelist[slave].Ibits + 7) / 8)) && (FMMUc < EC_MAXFMMU))
    {
       EC_PRINT("    FMMU %d\n", FMMUc);
       while ((SMc < (EC_MAXSM - 1)) && (context->slavelist[slave].SMtype[SMc] != 4))
@@ -916,7 +933,7 @@ static void ecx_config_create_output_mappings(ecx_contextt *context, void *pIOma
    configadr = context->slavelist[slave].configadr;
 
    /* search for SM that contribute to the output mapping */
-   while ((SMc < EC_MAXSM) && (FMMUdone < ((context->slavelist[slave].Obits + 7) / 8)))
+   while ((SMc < EC_MAXSM) && (FMMUdone < ((context->slavelist[slave].Obits + 7) / 8)) && (FMMUc < EC_MAXFMMU))
    {
       EC_PRINT("    FMMU %d\n", FMMUc);
       while ((SMc < (EC_MAXSM - 1)) && (context->slavelist[slave].SMtype[SMc] != 3))
@@ -1055,7 +1072,7 @@ static void ecx_config_create_mbxstatus_mappings(ecx_contextt *context, void *pI
       ecx_FPWR(&context->port, configadr, ECT_REG_FMMU0 + (sizeof(ec_fmmut) * FMMUc),
                sizeof(ec_fmmut), &(context->slavelist[slave].FMMU[FMMUc]), EC_TIMEOUTRET3);
 
-      position = etohl(context->slavelist[slave].FMMU[FMMUc].LogStart);
+      position = etohl(context->slavelist[slave].FMMU[FMMUc].LogStart) - context->grouplist[group].logstartaddr;
       context->slavelist[slave].mbxstatus = (uint8 *)(pIOmap) + position;
       context->grouplist[group].mbxstatuslookup[context->grouplist[group].mbxstatuslength] = slave;
       context->grouplist[group].mbxstatuslength++;
@@ -1065,6 +1082,39 @@ static void ecx_config_create_mbxstatus_mappings(ecx_contextt *context, void *pI
          context->grouplist[group].inputsWKC++;
    }
    context->slavelist[slave].FMMUunused = FMMUc;
+}
+
+/** Check that the process data segments of a group fit in a frame.
+ * If not, the process data of the group is disabled.
+ *
+ * @param[in]  context    context struct
+ * @param[in]  group      group to check
+ * @return 1 if segments are valid, 0 otherwise
+ */
+static int ecx_config_check_segments(ecx_contextt *context, uint8 group)
+{
+   uint16 i;
+   uint32 maxsize = EC_MAXLRWDATA - EC_FIRSTDCDATAGRAM; /* first segment holds DC datagram */
+
+   for (i = 0; i < context->grouplist[group].nsegments; i++)
+   {
+      if (context->grouplist[group].IOsegment[i] > maxsize)
+      {
+         EC_PRINT("Process data of group %d does not fit in %d segments\n", group, EC_MAXIOSEGMENTS);
+         context->grouplist[group].Obytes = 0;
+         context->grouplist[group].Ibytes = 0;
+         context->grouplist[group].mbxstatuslength = 0;
+         context->grouplist[group].nsegments = 0;
+         if (!group)
+         {
+            context->slavelist[0].Obytes = 0;
+            context->slavelist[0].Ibytes = 0;
+         }
+         return 0;
+      }
+      maxsize = EC_MAXLRWDATA;
+   }
+   return 1;
 }
 
 static int ecx_main_config_map_group(ecx_contextt *context, void *pIOmap, uint8 group)
@@ -1085,6 +1135,7 @@ static int ecx_main_config_map_group(ecx_contextt *context, void *pIOmap, uint8 
       oLogAddr = LogAddr;
       BitPos = 0;
       context->grouplist[group].nsegments = 0;
+      context->grouplist[group].mbxstatuslength = 0;
       context->grouplist[group].outputsWKC = 0;
       context->grouplist[group].inputsWKC = 0;
 
@@ -1115,14 +1166,14 @@ static int ecx_main_config_map_group(ecx_contextt *context, void *pIOmap, uint8 
 
                diff = LogAddr - oLogAddr;
                oLogAddr = LogAddr;
-               if ((segmentsize + diff) > segmentmaxsize && diff <= segmentmaxsize && currentsegment < EC_MAXIOSEGMENTS)
+               if ((segmentsize + diff) > segmentmaxsize && diff <= segmentmaxsize && currentsegment < (EC_MAXIOSEGMENTS - 1))
                {
                   context->grouplist[group].IOsegment[currentsegment++] = segmentsize;
                   segmentsize = 0;
                   segmentmaxsize = EC_MAXLRWDATA; /* can ignore DC overhead after first segment */
                }
                segmentsize += diff;
-               while (segmentsize > segmentmaxsize && currentsegment < EC_MAXIOSEGMENTS)
+               while (segmentsize > segmentmaxsize && currentsegment < (EC_MAXIOSEGMENTS - 1))
                {
                   context->grouplist[group].IOsegment[currentsegment++] = segmentmaxsize;
                   segmentsize -= segmentmaxsize;
@@ -1140,7 +1191,7 @@ static int ecx_main_config_map_group(ecx_contextt *context, void *pIOmap, uint8 
          LogAddr++;
          oLogAddr = LogAddr;
          BitPos = 0;
-         if ((segmentsize + 1) > segmentmaxsize && currentsegment < EC_MAXIOSEGMENTS)
+         if ((segmentsize + 1) > segmentmaxsize && currentsegment < (EC_MAXIOSEGMENTS - 1))
          {
             context->grouplist[group].IOsegment[currentsegment++] = segmentsize;
             segmentsize = 0;
@@ -1159,6 +1210,19 @@ static int ecx_main_config_map_group(ecx_contextt *context, void *pIOmap, uint8 
          context->slavelist[0].outputs = pIOmap;
          context->slavelist[0].Obytes = LogAddr -
                                         context->grouplist[group].logstartaddr; /* store output bytes in master record */
+      }
+      /* with blockLRW the inputs are sent first using LRD, starting in this segment,
+       * and that frame carries the DC datagram, so leave room for it */
+      for (slave = 1; slave <= context->slavecount; slave++)
+      {
+         if ((!group || (group == context->slavelist[slave].group)) && context->slavelist[slave].blockLRW)
+         {
+            if (segmentmaxsize > (segmentsize + EC_MAXLRWDATA - EC_FIRSTDCDATAGRAM))
+            {
+               segmentmaxsize = segmentsize + EC_MAXLRWDATA - EC_FIRSTDCDATAGRAM;
+            }
+            break;
+         }
       }
 
       /* do input mapping of slave and program FMMUs */
@@ -1185,14 +1249,14 @@ static int ecx_main_config_map_group(ecx_contextt *context, void *pIOmap, uint8 
 
                diff = LogAddr - oLogAddr;
                oLogAddr = LogAddr;
-               if ((segmentsize + diff) > segmentmaxsize && diff <= segmentmaxsize && currentsegment < EC_MAXIOSEGMENTS)
+               if ((segmentsize + diff) > segmentmaxsize && diff <= segmentmaxsize && currentsegment < (EC_MAXIOSEGMENTS - 1))
                {
                   context->grouplist[group].IOsegment[currentsegment++] = segmentsize;
                   segmentsize = 0;
                   segmentmaxsize = EC_MAXLRWDATA; /* can ignore DC overhead after first segment */
                }
                segmentsize += diff;
-               while (segmentsize > segmentmaxsize && currentsegment < EC_MAXIOSEGMENTS)
+               while (segmentsize > segmentmaxsize && currentsegment < (EC_MAXIOSEGMENTS - 1))
                {
                   context->grouplist[group].IOsegment[currentsegment++] = segmentmaxsize;
                   segmentsize -= segmentmaxsize;
@@ -1210,7 +1274,7 @@ static int ecx_main_config_map_group(ecx_contextt *context, void *pIOmap, uint8 
          LogAddr++;
          oLogAddr = LogAddr;
          BitPos = 0;
-         if ((segmentsize + 1) > segmentmaxsize && currentsegment < EC_MAXIOSEGMENTS)
+         if ((segmentsize + 1) > segmentmaxsize && currentsegment < (EC_MAXIOSEGMENTS - 1))
          {
             context->grouplist[group].IOsegment[currentsegment++] = segmentsize;
             segmentsize = 0;
@@ -1253,7 +1317,8 @@ static int ecx_main_config_map_group(ecx_contextt *context, void *pIOmap, uint8 
       context->grouplist[group].IOsegment[currentsegment] = segmentsize;
       context->grouplist[group].nsegments = currentsegment + 1;
       context->grouplist[group].mbxstatus = (uint8 *)(pIOmap) + context->grouplist[group].Obytes + context->grouplist[group].Ibytes;
-      context->grouplist[group].mbxstatuslength = LogAddr - context->grouplist[group].Obytes - context->grouplist[group].Ibytes;
+      context->grouplist[group].mbxstatuslength = LogAddr - context->grouplist[group].logstartaddr -
+                                                  context->grouplist[group].Obytes - context->grouplist[group].Ibytes;
       if (!group)
       {
          context->slavelist[0].inputs = (uint8 *)(pIOmap) + context->slavelist[0].Obytes;
@@ -1261,6 +1326,11 @@ static int ecx_main_config_map_group(ecx_contextt *context, void *pIOmap, uint8 
                                         context->grouplist[group].logstartaddr -
                                         context->slavelist[0].Obytes; /* store input bytes in master record */
          context->slavelist[0].mbxstatus = (uint8 *)(pIOmap) + context->slavelist[0].Obytes + context->slavelist[0].Ibytes;
+      }
+
+      if (!ecx_config_check_segments(context, group))
+      {
+         return 0;
       }
 
       /* Do post mapping actions */
@@ -1332,6 +1402,7 @@ static int ecx_config_overlap_map_group(ecx_contextt *context, void *pIOmap, uin
       soLogAddr = mLogAddr;
       BitPos = 0;
       context->grouplist[group].nsegments = 0;
+      context->grouplist[group].mbxstatuslength = 0;
       context->grouplist[group].outputsWKC = 0;
       context->grouplist[group].inputsWKC = 0;
 
@@ -1376,14 +1447,14 @@ static int ecx_config_overlap_map_group(ecx_contextt *context, void *pIOmap, uin
             int soLength = soLogAddr - mLogAddr;
             int siLength = siLogAddr - mLogAddr;
             mLogAddr = tempLogAddr;
-            if ((segmentsize + diff) > segmentmaxsize && diff <= segmentmaxsize && currentsegment < EC_MAXIOSEGMENTS)
+            if ((segmentsize + diff) > segmentmaxsize && diff <= segmentmaxsize && currentsegment < (EC_MAXIOSEGMENTS - 1))
             {
                context->grouplist[group].IOsegment[currentsegment++] = segmentsize;
                segmentsize = 0;
                segmentmaxsize = EC_MAXLRWDATA; /* can ignore DC overhead after first segment */
             }
             segmentsize += diff;
-            while (segmentsize > segmentmaxsize && currentsegment < EC_MAXIOSEGMENTS)
+            while (segmentsize > segmentmaxsize && currentsegment < (EC_MAXIOSEGMENTS - 1))
             {
                context->grouplist[group].IOsegment[currentsegment++] = segmentmaxsize;
                segmentsize -= segmentmaxsize;
@@ -1412,8 +1483,12 @@ static int ecx_config_overlap_map_group(ecx_contextt *context, void *pIOmap, uin
       context->grouplist[group].Ibytes = siLogAddr - context->grouplist[group].logstartaddr;
       context->grouplist[group].outputs = pIOmap;
       context->grouplist[group].inputs = (uint8 *)pIOmap + context->grouplist[group].Obytes;
-
-      context->grouplist[group].mbxstatus = (uint8 *)pIOmap + context->grouplist[group].Obytes + context->grouplist[group].Ibytes;
+      /* In overlapping mode we need to consider max for Obytes/Ibytes for start of mbxstatus
+       * after last slave in logic address space.
+       */
+      context->grouplist[group].mbxstatus = (uint8 *)pIOmap + context->grouplist[group].Obytes +
+         ((context->grouplist[group].Obytes > context->grouplist[group].Ibytes) ?
+           context->grouplist[group].Obytes : context->grouplist[group].Ibytes);
 
       /* Move calculated inputs with OBytes offset */
       for (slave = 1; slave <= context->slavecount; slave++)
@@ -1449,15 +1524,17 @@ static int ecx_config_overlap_map_group(ecx_contextt *context, void *pIOmap, uin
             {
                segmentsize += diff;
             }
-            /* Move calculated mbxstatus with OBytes + Ibytes offset */
+            /* Move calculated mbxstatus with OBytes offset, received data is placed after outputs */
             context->slavelist[slave].mbxstatus += context->grouplist[group].Obytes;
-            context->slavelist[slave].mbxstatus += context->grouplist[group].Ibytes;
          }
       }
 
       /* Update segment info */
       context->grouplist[group].IOsegment[currentsegment] = segmentsize;
       context->grouplist[group].nsegments = currentsegment + 1;
+      context->grouplist[group].mbxstatuslength = mLogAddr - context->grouplist[group].logstartaddr -
+         ((context->grouplist[group].Obytes > context->grouplist[group].Ibytes) ?
+           context->grouplist[group].Obytes : context->grouplist[group].Ibytes);
 
       if (!group)
       {
@@ -1466,9 +1543,14 @@ static int ecx_config_overlap_map_group(ecx_contextt *context, void *pIOmap, uin
          context->slavelist[0].Obytes = soLogAddr - context->grouplist[group].logstartaddr;
          context->slavelist[0].inputs = (uint8 *)pIOmap + context->slavelist[0].Obytes;
          context->slavelist[0].Ibytes = siLogAddr - context->grouplist[group].logstartaddr;
-         context->slavelist[0].mbxstatus = (uint8 *)pIOmap +
-                                           context->slavelist[0].Obytes +
-                                           context->slavelist[0].Ibytes;
+         context->slavelist[0].mbxstatus = (uint8 *)pIOmap + context->slavelist[0].Obytes +
+            ((context->slavelist[0].Obytes > context->slavelist[0].Ibytes) ?
+              context->slavelist[0].Obytes : context->slavelist[0].Ibytes);
+      }
+
+      if (!ecx_config_check_segments(context, group))
+      {
+         return 0;
       }
 
       /* Do post mapping actions */

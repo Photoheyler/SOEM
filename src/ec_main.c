@@ -41,6 +41,10 @@ typedef struct OSAL_PACKED
 } ec_mbxerrort;
 OSAL_PACKED_END
 
+/* Validate mailbox error structure meets protocol minimum */
+EC_STATIC_ASSERT(sizeof(ec_mbxerrort) == (sizeof(ec_mbxheadert) + EC_MBX_MIN_ERR),
+                 "ec_mbxerrort incorrect size");
+
 /** emergency request structure */
 OSAL_PACKED_BEGIN
 typedef struct OSAL_PACKED
@@ -159,6 +163,36 @@ void ecx_packeterror(ecx_contextt *context, uint16 Slave, uint16 Index, uint8 Su
    Ec.Etype = EC_ERR_TYPE_PACKET_ERROR;
    Ec.ErrorCode = ErrorCode;
    ecx_pusherror(context, &Ec);
+}
+
+/** Validate mailbox length against protocol-specific minimums
+ *
+ * @param[in]  mbxtype      Mailbox type (lower 4 bits)
+ * @param[in]  mbx_length   Mailbox length field value
+ * @return 1 if valid, 0 if invalid
+ */
+static int ecx_mbx_validate_length(uint8 mbxtype, uint16 mbx_length)
+{
+   switch (mbxtype)
+   {
+   case ECT_MBXT_COE:
+      return (mbx_length >= EC_MBX_MIN_COE);
+   case ECT_MBXT_SOE:
+      return (mbx_length >= EC_MBX_MIN_SOE);
+   case ECT_MBXT_EOE:
+      return (mbx_length >= EC_MBX_MIN_EOE);
+   case ECT_MBXT_FOE:
+      return (mbx_length >= EC_MBX_MIN_FOE);
+   case ECT_MBXT_VOE:
+      return (mbx_length >= EC_MBX_MIN_VOE);
+   case ECT_MBXT_AOE:
+      return (mbx_length >= EC_MBX_MIN_AOE);
+   case ECT_MBXT_ERR:
+      return (mbx_length >= EC_MBX_MIN_ERR);
+   default:
+      /* Unknown type - reject */
+      return 0;
+   }
 }
 
 /** Report Mailbox Error
@@ -554,18 +588,20 @@ uint8 ecx_siigetbyte(ecx_contextt *context, uint16 slave, uint16 address)
          ecx_eeprom2master(context, slave); /* set eeprom control to master */
          eadr = address >> 1;
          edat64 = ecx_readeepromFP(context, configadr, eadr, EC_TIMEOUTEEP);
-         /* 8 byte response */
+         /* 8 or 4 byte response, limited to the end of the cache */
+         cnt = context->slavelist[slave].eep_8byte ? 8 : 4;
+         if (cnt > (EC_MAXEEPBUF - (eadr << 1)))
+         {
+            cnt = EC_MAXEEPBUF - (eadr << 1);
+         }
          if (context->slavelist[slave].eep_8byte)
          {
-            put_unaligned64(edat64, &(context->esibuf[eadr << 1]));
-            cnt = 8;
+            memcpy(&(context->esibuf[eadr << 1]), &edat64, cnt);
          }
-         /* 4 byte response */
          else
          {
             edat32 = (uint32)edat64;
-            put_unaligned32(edat32, &(context->esibuf[eadr << 1]));
-            cnt = 4;
+            memcpy(&(context->esibuf[eadr << 1]), &edat32, cnt);
          }
          /* find bitmap location */
          mapw = eadr >> 4;
@@ -598,6 +634,7 @@ int16 ecx_siifind(ecx_contextt *context, uint16 slave, uint16 cat)
 {
    int16 a;
    uint16 p;
+   uint32 next;
    uint8 eectl = context->slavelist[slave].eep_pdi;
 
    a = ECT_SII_START << 1;
@@ -610,8 +647,14 @@ int16 ecx_siifind(ecx_contextt *context, uint16 slave, uint16 cat)
       /* read section length */
       p = ecx_siigetbyte(context, slave, a++);
       p += (ecx_siigetbyte(context, slave, a++) << 8);
-      /* locate next section category */
-      a += p << 1;
+      /* locate next section category, stop at end of EEPROM cache */
+      next = (uint32)a + ((uint32)p << 1);
+      if (next >= EC_MAXEEPBUF)
+      {
+         p = 0xffff;
+         break;
+      }
+      a = (int16)next;
       /* read section category */
       p = ecx_siigetbyte(context, slave, a++);
       p += (ecx_siigetbyte(context, slave, a++) << 8);
@@ -1296,7 +1339,7 @@ int ecx_mbxinhandler(ecx_contextt *context, uint8 group, int limit)
          {
             uint16 mbxl = slaveitem->mbx_rl;
             uint16 mbxro = slaveitem->mbx_ro;
-            if ((mbxl > 0) && (mbx = ecx_getmbx(context)))
+            if ((mbxl > 0) && (mbxl <= EC_MAXMBX) && (mbx = ecx_getmbx(context)))
             {
                /* keep track of work limit */
                if (++limitcnt >= limit) maxcnt = 0;
@@ -1304,12 +1347,31 @@ int ecx_mbxinhandler(ecx_contextt *context, uint8 group, int limit)
                if (wkc > 0)
                {
                   mbxh = (ec_mbxheadert *)mbx;
-                  if ((mbxh->mbxtype & 0x0f) == ECT_MBXT_ERR) /* Mailbox error response? */
+                  uint16 mbx_length = etohs(mbxh->length);
+                  uint8 mbxtype = mbxh->mbxtype & 0x0f;
+
+                  /* Validate mailbox length */
+                  if (((uint32)mbx_length + sizeof(ec_mbxheadert)) > mbxl)
+                  {
+                     ecx_packeterror(context, slave, 0, 0, 21); /* mailbox length exceeds capacity */
+                     ecx_dropmbx(context, mbx);
+                     mbx = NULL;
+                     wkc = 0;
+                  }
+                  else if (!ecx_mbx_validate_length(mbxtype, mbx_length))
+                  {
+                     ecx_packeterror(context, slave, 0, 0, 25); /* protocol minimum size violation */
+                     ecx_dropmbx(context, mbx);
+                     mbx = NULL;
+                     wkc = 0;
+                  }
+
+                  if ((wkc > 0) && (mbxtype == ECT_MBXT_ERR)) /* Mailbox error response? */
                   {
                      MBXEp = (ec_mbxerrort *)mbx;
                      ecx_mbxerror(context, slave, etohs(MBXEp->Detail));
                   }
-                  else if ((mbxh->mbxtype & 0x0f) == ECT_MBXT_COE) /* CoE response? */
+                  else if ((wkc > 0) && (mbxtype == ECT_MBXT_COE)) /* CoE response? */
                   {
                      EMp = (ec_emcyt *)mbx;
                      if ((etohs(EMp->CANOpen) >> 12) == 0x01) /* Emergency request? */
@@ -1331,7 +1393,7 @@ int ecx_mbxinhandler(ecx_contextt *context, uint8 group, int limit)
                         }
                      }
                   }
-                  else if ((mbxh->mbxtype & 0x0f) == ECT_MBXT_SOE) /* SoE response? */
+                  else if ((wkc > 0) && (mbxtype == ECT_MBXT_SOE)) /* SoE response? */
                   {
                      if (slaveitem->soembxin && (slaveitem->soembxinfull == FALSE))
                      {
@@ -1344,7 +1406,7 @@ int ecx_mbxinhandler(ecx_contextt *context, uint8 group, int limit)
                         slaveitem->soembxoverrun++;
                      }
                   }
-                  else if ((mbxh->mbxtype & 0x0f) == ECT_MBXT_EOE) /* EoE response? */
+                  else if ((wkc > 0) && (mbxtype == ECT_MBXT_EOE)) /* EoE response? */
                   {
                      ec_EOEt *eoembx = (ec_EOEt *)mbx;
                      uint16 frameinfo1 = etohs(eoembx->frameinfo1);
@@ -1374,7 +1436,7 @@ int ecx_mbxinhandler(ecx_contextt *context, uint8 group, int limit)
                         slaveitem->eoembxoverrun++;
                      }
                   }
-                  else if ((mbxh->mbxtype & 0x0f) == ECT_MBXT_FOE) /* FoE response? */
+                  else if ((wkc > 0) && (mbxtype == ECT_MBXT_FOE)) /* FoE response? */
                   {
                      if (slaveitem->foembxin && (slaveitem->foembxinfull == FALSE))
                      {
@@ -1387,7 +1449,7 @@ int ecx_mbxinhandler(ecx_contextt *context, uint8 group, int limit)
                         slaveitem->foembxoverrun++;
                      }
                   }
-                  else if ((mbxh->mbxtype & 0x0f) == ECT_MBXT_VOE) /* VoE response? */
+                  else if ((wkc > 0) && (mbxtype == ECT_MBXT_VOE)) /* VoE response? */
                   {
                      if (slaveitem->voembxin && (slaveitem->voembxinfull == FALSE))
                      {
@@ -1400,7 +1462,7 @@ int ecx_mbxinhandler(ecx_contextt *context, uint8 group, int limit)
                         slaveitem->voembxoverrun++;
                      }
                   }
-                  else if ((mbxh->mbxtype & 0x0f) == ECT_MBXT_AOE) /* AoE response? */
+                  else if ((wkc > 0) && (mbxtype == ECT_MBXT_AOE)) /* AoE response? */
                   {
                      if (slaveitem->aoembxin && (slaveitem->aoembxinfull == FALSE))
                      {
@@ -1467,7 +1529,7 @@ int ecx_mbxouthandler(ecx_contextt *context, uint8 group, int limit)
          configadr = context->slavelist[slave].configadr;
          mbxwo = context->slavelist[slave].mbx_wo;
          limitcnt++;
-         if (context->slavelist[slave].state >= EC_STATE_PRE_OP)
+         if ((mbxl > 0) && (mbxl <= EC_MAXMBX) && context->slavelist[slave].state >= EC_STATE_PRE_OP)
          {
             /* write slave in mailbox 1st try*/
             wkc = ecx_FPWR(&context->port, configadr, mbxwo, mbxl, mbx, EC_TIMEOUTRET);
@@ -1605,12 +1667,11 @@ int ecx_mbxreceive(ecx_contextt *context, uint16 slave, ec_mbxbuft **mbx, int ti
    uint8 SMstat;
    uint16 SMstatex;
    uint8 SMcontr;
-   ec_mbxbuft *mbxin;
-   ec_mbxheadert *mbxh;
    ec_emcyt *EMp;
    ec_mbxerrort *MBXEp;
    osal_timert timer;
    ec_slavet *slavelist = &(context->slavelist[slave]);
+   uint16 mbx_length;
 
    configadr = slavelist->configadr;
    mbxl = slavelist->mbx_rl;
@@ -1670,17 +1731,49 @@ int ecx_mbxreceive(ecx_contextt *context, uint16 slave, ec_mbxbuft **mbx, int ti
 
       if ((wkc > 0) && ((SMstat & 0x08) > 0)) /* read mailbox available ? */
       {
+         ec_mbxbuft *mbxin = NULL;
+         ec_mbxheadert *mbxh = NULL;
          mbxro = slavelist->mbx_ro;
-         mbxin = ecx_getmbx(context);  
-         if (mbxin == NULL)
-         { 
-             *mbx = NULL;   
-             return 0;     
-         }
-         mbxh = (ec_mbxheadert *)mbxin;
          do
          {
+            /* Acquire fresh buffer at start of each iteration */
+            if (mbxin == NULL)
+            {
+               mbxin = ecx_getmbx(context);
+               if (mbxin == NULL)
+               {
+                  *mbx = NULL;
+                  return 0;
+               }
+               mbxh = (ec_mbxheadert *)mbxin;
+            }
+
             wkc = ecx_FPRD(&context->port, configadr, mbxro, mbxl, mbxin, EC_TIMEOUTRET); /* get mailbox */
+
+            /* Validate mailbox length */
+            if (wkc > 0)
+            {
+               mbx_length = etohs(mbxh->length);
+               uint8 mbxtype = mbxh->mbxtype & 0x0f;
+
+               /* Reject if length exceeds what slave can send in this mailbox */
+               if (((uint32)mbx_length + sizeof(ec_mbxheadert)) > mbxl)
+               {
+                  ecx_packeterror(context, slave, 0, 0, 21); /* mailbox length exceeds capacity */
+                  ecx_dropmbx(context, mbxin);
+                  mbxin = NULL;
+                  wkc = 0;
+               }
+               /* Reject if length violates protocol-specific minimum */
+               else if (!ecx_mbx_validate_length(mbxtype, mbx_length))
+               {
+                  ecx_packeterror(context, slave, 0, 0, 25); /* protocol minimum size violation */
+                  ecx_dropmbx(context, mbxin);
+                  mbxin = NULL;
+                  wkc = 0;
+               }
+            }
+
             if ((wkc > 0) && ((mbxh->mbxtype & 0x0f) == 0x00))                            /* Mailbox error response? */
             {
                MBXEp = (ec_mbxerrort *)mbxin;
